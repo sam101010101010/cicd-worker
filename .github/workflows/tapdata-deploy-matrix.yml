@@ -444,8 +444,13 @@ jobs:
         run: |
           set -euo pipefail
           INCLUDE='[]'
+          N=0
+          # order 字段：按 add 调用顺序（= 真实执行顺序）递增编号。仅用于 GitHub 运行图
+          # 的显示排序——GitHub 把 matrix 腿按 job 名称字母序排列，给名字加数字前缀后，
+          # 字母序即等于 max-parallel:1 的执行序（connections→FDM→MDM→APIs）。
           add() {
-            INCLUDE=$(jq -c --argjson e "$1" '. + [$e]' <<<"$INCLUDE")
+            N=$((N+1))
+            INCLUDE=$(jq -c --argjson e "$1" --arg o "$N" '. + [($e + {order: $o})]' <<<"$INCLUDE")
           }
 
           if [[ "${{ steps.preview_connections.outputs.has_changes }}" == "true" ]]; then
@@ -499,7 +504,7 @@ jobs:
   #   - 只有有变更的资源才会成为 matrix 腿 → 运行图里看不到"已跳过"节点
   # ============================================================
   deploy:
-    name: Deploy ${{ matrix.label }}
+    name: Deploy ${{ matrix.order }}. ${{ matrix.label }}
     runs-on: [self-hosted, tapdata]
     timeout-minutes: 15
     environment: deploy
