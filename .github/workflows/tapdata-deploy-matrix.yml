@@ -317,7 +317,8 @@ jobs:
       migrate_tasks_has_changes: ${{ steps.preview_migrate_tasks.outputs.has_changes }}
       sync_tasks_has_changes: ${{ steps.preview_sync_tasks.outputs.has_changes }}
       apis_has_changes: ${{ steps.preview_apis.outputs.has_changes }}
-      # 核心：动态 matrix（只含有变更的资源）+ 是否存在任何变更
+      # 核心：部署清单 JSON（只含有变更资源、已按部署序排好）+ 是否存在任何变更
+      # 注：变量名仍叫 deploy_matrix（历史沿用），实为 deploy job 循环用的有序清单。
       deploy_matrix: ${{ steps.build_matrix.outputs.deploy_matrix }}
       has_any_changes: ${{ steps.build_matrix.outputs.has_any_changes }}
     steps:
@@ -446,9 +447,10 @@ jobs:
           set -euo pipefail
           INCLUDE='[]'
           N=0
-          # order 字段：按 add 调用顺序（= 真实执行顺序）递增编号。仅用于 GitHub 运行图
-          # 的显示排序——GitHub 把 matrix 腿按 job 名称字母序排列，给名字加数字前缀后，
-          # 字母序即等于 max-parallel:1 的执行序（connections→FDM→MDM→APIs）。
+          # order 字段：按 add 调用顺序（= 真实部署顺序）递增编号，1-based。include 数组
+          # 本身已是 connections→FDM→MDM→APIs 顺序；deploy job 直接按数组序循环执行，
+          # order 仅用于循环里打印 [order/COUNT] 日志分组标签。
+          # （注：GitHub 不按 job 名排 matrix 腿，故已弃用 matrix，改单 job 循环。）
           add() {
             N=$((N+1))
             INCLUDE=$(jq -c --argjson e "$1" --arg o "$N" '. + [($e + {order: $o})]' <<<"$INCLUDE")
@@ -498,23 +500,22 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================
-  # Job 4: Deploy（统一动态 matrix，替代原 connections/FDM/MDM/APIs 四个 job）
-  #   - environment: deploy → 单次人工审批覆盖所有 matrix 腿
-  #   - max-parallel: 1 + 按 connections→FDM→MDM→APIs 顺序 → 严格串行
-  #   - fail-fast: true → 某腿失败即取消后续腿（等价于原依赖链"出错即停"）
-  #   - 只有有变更的资源才会成为 matrix 腿 → 运行图里看不到"已跳过"节点
+  # Job 4: Deploy（单个 job，内部按 connections→FDM→MDM→APIs 顺序串行部署）
+  #   - environment: deploy → 单次人工审批覆盖全部资源
+  #   - 替代原"四腿动态 matrix"：matrix 腿在运行图里的显示顺序 GitHub 不可控
+  #     （见 actions/runner#703），加数字前缀也无效。改成单节点循环后运行图里
+  #     只有一个 Deploy 节点，不存在腿排序问题，执行顺序 100% 由脚本保证。
+  #   - 部署清单复用 preview-all 的 deploy_matrix（只含有变更资源、已按部署序排好）。
+  #   - set -e：任一资源导入失败即中止后续资源（等价于原 fail-fast）。
+  #   - has_any_changes==false 时整个 job 跳过 → 运行图里仍是一个灰色 Deploy 节点。
   # ============================================================
   deploy:
-    name: Deploy ${{ matrix.order }}. ${{ matrix.label }}
+    name: Deploy
     runs-on: [self-hosted, tapdata]
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: deploy
     needs: [preparation, preview-all]
     if: needs.preview-all.outputs.has_any_changes == 'true'
-    strategy:
-      max-parallel: 1
-      fail-fast: true
-      matrix: ${{ fromJSON(needs.preview-all.outputs.deploy_matrix) }}
     env:
       PROJECT: ${{ needs.preparation.outputs.project }}
     steps:
@@ -567,23 +568,35 @@ jobs:
           VAULT_ENCRYPTION_KEY: ${{ secrets.VAULT_ENCRYPTION_KEY }}
           CRYPTO_ACTION: decrypt
 
-      - name: Compress Export Files
-        run: bash ${{ env.SCRIPT_ROOT }}/scripts/common/compress-files.sh
+      # 按 deploy_matrix（已排序、只含有变更资源）逐个 compress + import。
+      # 顺序固定：connections → Data Replication(FDM) → Data Transformation(MDM) → APIs。
+      # 每个资源用 ::group:: 折叠成日志分组，标题带 [order/COUNT]，顺序一目了然。
+      - name: Deploy changed resources in order
         env:
           REPO_ROOT: ${{ env.REPO_ROOT }}
           DEPLOY_DIR: ${{ env.DEPLOY_DIR }}
-          ARCHIVE_NAME: ${{ matrix.archive }}
           PROJECT: ${{ env.PROJECT }}
-
-      - name: Import ${{ matrix.label }} via TapData API
-        id: import_resource
-        run: bash ${{ env.SCRIPT_ROOT }}/scripts/common/import-resource.sh ${{ matrix.import_arg }}
-        env:
-          DEPLOY_DIR: ${{ env.DEPLOY_DIR }}
-          ARCHIVE_NAME: ${{ matrix.archive }}
           TAPDATA_TOKEN: ${{ needs.preparation.outputs.tapdata_token }}
           TAPDATA_URL: ${{ needs.preparation.outputs.tapdata_url }}
           TARGET_ENV: ${{ env.TARGET_ENV }}
+          DEPLOY_PLAN: ${{ needs.preview-all.outputs.deploy_matrix }}
+        run: |
+          set -euo pipefail
+          COUNT=$(jq '.include | length' <<<"$DEPLOY_PLAN")
+          echo "本次将按顺序部署 ${COUNT} 个资源"
+          for i in $(seq 0 "$((COUNT - 1))"); do
+            ENTRY=$(jq -c ".include[$i]" <<<"$DEPLOY_PLAN")
+            ORDER=$(jq -r '.order'           <<<"$ENTRY")
+            LABEL=$(jq -r '.label'           <<<"$ENTRY")
+            IMPORT_ARG=$(jq -r '.import_arg' <<<"$ENTRY")
+            export ARCHIVE_NAME="$(jq -r '.archive' <<<"$ENTRY")"
+
+            echo "::group::[${ORDER}/${COUNT}] Deploy ${LABEL}"
+            bash "${SCRIPT_ROOT}/scripts/common/compress-files.sh"
+            bash "${SCRIPT_ROOT}/scripts/common/import-resource.sh" "${IMPORT_ARG}"
+            echo "::endgroup::"
+          done
+          echo "✅ 全部 ${COUNT} 个资源部署完成"
 
   # ============================================================
   # Job 5: Deploy Group Info（始终收尾）
