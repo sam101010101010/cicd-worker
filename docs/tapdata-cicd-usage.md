@@ -252,17 +252,11 @@ workflow_dispatch:
         - lpt
         # - aat        # 若有 AAT 环境，添加此行
         # - prod       # 若有 Prod 环境，添加此行
-    project:
-      description: 'Project name'
-      required: true
-      type: choice
-      default: <你的默认项目名>        # ← 必改：填一个实际项目名
-      options:
-        - <project-1>                  # ← 必改：列出所有租户项目名
-        - <project-2>                  # ← 必改
 ```
 
-同样检查 `.github/workflows/tapdata-rollback.yml` 里的 `workflow_dispatch.inputs.target_env.options` 和 `project.options`，保持一致。
+> 项目名无需配置：遵循"一仓一项目"约定，deploy/rollback 会自动检测仓库内唯一的 `*_tapdata_export/` 目录（多租户模式下由租户仓库传入），所以 `workflow_dispatch` 已不再有 `project` 输入。
+
+同样检查 `.github/workflows/tapdata-rollback.yml` 里的 `workflow_dispatch.inputs.target_env.options`（回滚另有必填项 `last_stable_tag`），环境列表保持一致。
 
 > 这两个 `workflow_dispatch` 入口仅在"从 Worker 仓库直接触发"时生效。正常多租户模式下由租户仓库的工作流调用 `workflow_call`，此处 options 不影响租户调用。因此若你完全不使用 Worker 直接触发，可保留默认值。
 
@@ -309,12 +303,17 @@ on:
           - sit
           - aat
           - prod
+      project:
+        description: 'Project name (留空则取 vars.PROJECT_NAME，再回落到仓库名)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   deploy:
     uses: "{worker-org}/{worker-repo}/.github/workflows/tapdata-deploy.yml@main"
     with:
-      project: ${{ github.event.repository.name }}
+      project: ${{ inputs.project || vars.PROJECT_NAME || github.event.repository.name }}
       target_env: ${{ inputs.target_env || '' }}
       caller_repo: ${{ github.repository }}
       caller_sha: ${{ github.sha }}
@@ -524,11 +523,11 @@ sudo ./svc.sh status
 
 在 TapData 创建项目，将 8.2 资源加入项目，并配置 GitHub 导出：
 
-- **项目名** 与租户仓库名一致（`{tenant-repo}`）
+- **项目名**：按以下优先级解析（自高到低）——① `workflow_dispatch` 手动输入的 `project`；② 租户仓库 `vars.PROJECT_NAME`；③ 仓库名（`{tenant-repo}`）。下文以 `{project}` 表示解析结果，TapData 项目名需与之一致
 - **GitHub URL**：`https://github.com/{tenant-org}/{tenant-repo}`
 - **GitHub Token**：第 4 节申请的 PAT
 - **分支**：`main`
-- **导出目录**：`{tenant-repo}_tapdata_export`
+- **导出目录**：`{project}_tapdata_export`
 
 ### 8.4 导出到 GitHub → 触发 Dev 部署
 
@@ -600,29 +599,35 @@ SIT 验证通过后，通过 `workflow_dispatch` 手动部署到 AAT，再到 Pr
 1. 进入租户仓库 → **Actions** → 选择 `TapData Rollback`
 2. 点击 **Run workflow**
 3. 输入参数：
-   - **Target environment**：要回滚的环境（`sit` / `aat` / `prod`）
+   - **Target environment**：要回滚的环境（`sit` / `lpt` / `aat` / `prod`）
    - **Tag to rollback to**：目标 Tag（如 `v1.0.0`）
+   - **Project name**：项目名，必须与 `{project}_tapdata_export/` 目录前缀一致
 4. 点击 **Run workflow**
 
 ### 9.3 执行流程
 
 Rollback workflow 执行 4 个 Job：
 
-1. **preparation**：解析 Tag、获取 Token、Checkout 指定 Tag 的配置文件
-2. **stop-and-unpublish**：停止当前环境所有运行中的任务、下线所有 API
-3. **clean-and-reimport**：清理现有连接 / 任务 / API，从目标 Tag 重新导入
-4. **report**：生成回滚报告
+1. **preparation**：Checkout 数据仓库当前主线、解析 Tag、获取 Token、**扫描 `{project}_tapdata_export/Task/` 和 `Modules/` 收集本项目的任务名和 API 名**（用于把后续操作严格限定在本项目）
+2. **stop-and-clean**：仅停止本项目的运行中任务、仅下线本项目的 API、仅清理本项目的连接 / 任务 / API；若本项目当前无任务或 API，对应步骤自动跳过
+3. **import-and-activate**：Checkout 数据仓库到目标 Tag（拿稳定版配置），同时 Checkout worker 仓库当前 main（拿最新脚本），从目标 Tag 重新导入并按原状态启动 / 发布
+4. **generate-report**：生成回滚报告（区分 SUCCESS / FAILURE / CANCELLED）
+
+> **脚本与配置的版本策略**：回滚时**配置文件**回到目标 Tag，但**脚本**始终使用 worker 仓库 main 上的最新版本。这样能在回滚时享受脚本的最新修复，单仓库和多租户模式行为完全一致。
 
 ### 9.4 回滚后验证
 
 登录目标环境，确认资源版本与目标 Tag 一致，任务和 API 处于未启动 / 未发布状态，手动启动并验证正常运行。
 
-### 9.5 其他环境隔离
+### 9.5 项目与环境隔离
 
-Rollback 只影响指定的 Target environment，其他环境不受干扰：
+Rollback 严格按照"目标环境 × 项目名"双维度隔离，互不干扰：
 
-- 回滚 Prod 到 `v1.0.0`，Dev / SIT / AAT 仍为最新版本
-- 多租户仓库互不影响（一个租户回滚不影响其他租户）
+- **跨环境隔离**：回滚 Prod 到 `v1.0.0`，Dev / SIT / LPT / AAT 仍为最新版本
+- **跨租户仓库隔离**：一个租户的回滚不影响其他租户
+- **同环境同租户内的跨项目隔离**：若一个租户在同一环境部署了多个 `{project}_tapdata_export/` 项目（如 `project-a` 和 `project-b`），针对 `project-a` 的回滚**只会触碰 `project-a` 的资源**，`project-b` 的任务 / API / 连接保持原状
+
+> **背景**：早期版本的 `stop-and-clean` 在未传入项目名时会进入"停止 / 下线 / 删除全部资源"模式，多项目共享环境时会误伤同租户的其他项目。现在 preparation 会从 export 目录扫描本项目的任务名 / API 名，下游操作严格按名字限定范围。
 
 ---
 

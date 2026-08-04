@@ -81,7 +81,8 @@ TapData 平台通过 **用户 → 角色 → 权限** 三层模型实现多租�
 
 | 文件路径 | 说明 |
 |---------|------|
-| `tapdata-cicd-worker/.github/workflows/tapdata-deploy.yml` | 核心部署工作流（8个 Job，含审批门） |
+| `tapdata-cicd-worker/.github/workflows/tapdata-deploy.yml` | **生效中**的部署工作流（租户 caller 固定指向它）；内容从 `.github/deploy/` 选型库提升而来。详见「2.1.1 部署变体选型」 |
+| `tapdata-cicd-worker/.github/deploy/*.yml` | 部署变体**选型库**（惰性文件，不自动触发、不被 `uses:` 调用）：multi-job/matrix × artifact v4/v3，详见「2.1.1」 |
 | `tapdata-cicd-worker/.github/workflows/tapdata-rollback.yml` | 回滚工作流（4个 Job） |
 | `tapdata-cicd-worker/scripts/common/get-token.sh` | 获取 TapData 访问 Token |
 | `tapdata-cicd-worker/scripts/common/compress-files.sh` | 压缩导出文件 |
@@ -92,9 +93,41 @@ TapData 平台通过 **用户 → 角色 → 权限** 三层模型实现多租�
 | `tapdata-cicd-worker/scripts/tapdata-deploy/generate-vault.sh` | 从 GitHub Secrets 生成 vault.json |
 | `tapdata-cicd-worker/scripts/tapdata-deploy/validate-inputs.sh` | 验证部署参数 |
 | `tapdata-cicd-worker/scripts/tapdata-deploy/generate-report.sh` | 生成部署汇总报告 |
+| `tapdata-cicd-worker/scripts/tapdata-rollback/collect-names.sh` | 扫描 export 目录，按项目限定回滚范围 |
 | `tapdata-cicd-worker/scripts/tapdata-rollback/resolve-tag.sh` | 解析回滚目标 Tag |
 | `tapdata-cicd-worker/scripts/tapdata-rollback/clean-resources.sh` | 清理现有资源 |
 | `tapdata-cicd-worker/tenant-template/.github/workflows/tapdata-deploy.yml` | 租户工作流模板 |
+
+### 2.1.1 部署变体选型（`.github/deploy/` 选型库 + 固定入口）
+
+部署有多个变体，按两个维度组合：
+
+- **Job 结构**
+  - `multi-job`：每类资源（connections / FDM / MDM / APIs）一个独立 deploy job；无变更的资源 job 会以灰色"已跳过"出现在运行图里，部署前最多 4 次人工审批。
+  - `matrix`：4 类资源合并成 1 个 deploy job，用动态 `strategy.matrix` 只展开有变更的资源；无变更的资源不进运行图、不显示灰色"已跳过"，部署前合并为 1 次审批。
+- **artifact 大版本**：`v4`（github.com / 较新 GHES）vs `v3`（部分较旧 GHES 不支持 v4）。原因：作业间通过 GitHub Artifact 传递 `vault.json`。
+
+当前提供的变体（都在 `.github/deploy/`）：
+
+| 变体文件 | Job 结构 | artifact | 适用 |
+|---------|---------|---------|------|
+| `tapdata-deploy-multi-job.yml` | multi-job | v4 | github.com，需要每类资源单独审批 |
+| `tapdata-deploy-matrix.yml` | matrix | v4 | github.com，合并审批、运行图干净 |
+| `tapdata-deploy-matrix-artifact-v3.yml` | matrix | v3 | **HA 客户 / 较旧 GHES** |
+
+**关键设计：`.github/deploy/` 是惰性选型库，不是生效目录。** GitHub 只把 `.github/workflows/*.yml` 当 workflow（自动触发、可被 `uses:` 调用）；放在 `.github/deploy/` 的文件不会触发、不会被 `uses:` 调用、也不会出现在 Actions 列表里。因此同时存放多个变体**不会**重复触发——不再需要"删掉另一个文件"。
+
+**如何切换变体（worker 侧一次性操作）**：把选好的变体拷到生效路径 `.github/workflows/tapdata-deploy.yml` 即可，例如交付给 HA / GHES 客户：
+
+```bash
+cp .github/deploy/tapdata-deploy-matrix-artifact-v3.yml .github/workflows/tapdata-deploy.yml
+```
+
+**租户无需改动**：租户 caller 的 `uses:` 永远固定为 `{WORKER_REPO}/.github/workflows/tapdata-deploy.yml@main`。换变体只改 worker 仓库这一个文件，N 个租户一个字都不用动——这正是"变体进选型库、入口固定"的目的。
+
+> 备注：artifact 上传失败时（如 GHES 关闭了 artifact 功能），各变体都会自动回退到本地文件传输（`VAULT_TRANSPORT`，详见 `setup-checklist.md`）。若 GHES 上 artifact 功能可用但仅支持 v3，直接用 `tapdata-deploy-matrix-artifact-v3.yml`。
+
+---
 
 ### 2.2 文档文件
 
@@ -245,7 +278,7 @@ URI：mongodb://{用户专属账号}:{密码}@{host}:27017/mdm
 
    | 字段 | 值 |
    |-----|---|
-   | 项目名称 | 与租户仓库名保持一致，如 `tenant-a` |
+   | 项目名称 | 默认与租户仓库名保持一致，如 `tenant-a`；如需不一致，在租户仓库 Settings → Variables 设置 `PROJECT_NAME`，TapData 项目名需与该变量一致 |
    | 描述 | Tenant A 团队资源集合 |
 
 3. 将上述连接、任务、API 添加到对应项目
@@ -433,14 +466,20 @@ jobs:
 
 ### 6.4 配置 TapData 项目
 
-确认 TapData 平台上已存在与租户仓库同名的项目：
+确认 TapData 平台上已存在与"解析后的项目名"同名的项目。**项目名按以下优先级解析**（自高到低）：
 
-| 仓库名 | TapData 项目名 |
-|-------|--------------|
-| `tenant-b` | `tenant-b` |
-| `tenant-a` | `tenant-a` |
+1. `workflow_dispatch` 手动触发时传入的 `project` 输入（单次覆盖）
+2. 租户仓库 `vars.PROJECT_NAME` 变量
+3. 租户仓库名
 
-> 如果项目名不一致，部署流程无法正确识别并过滤资源范围。
+| 租户仓库 | 手动 `project` 输入 | `vars.PROJECT_NAME` | 解析后的 TapData 项目名 |
+|---|---|---|---|
+| `tenant-a` | _空_ | _未设置_ | `tenant-a` |
+| `tenant-b` | _空_ | _未设置_ | `tenant-b` |
+| `foo-cicd-config` | _空_ | `foo` | `foo` |
+| `foo-cicd-config` | `bar` | `foo` | `bar` |
+
+> 部署流程会按"解析后的项目名"查找 `{project}_tapdata_export/` 目录并匹配 TapData 项目，三者必须一致。
 
 ---
 
@@ -599,12 +638,15 @@ git push origin tenant-b-v1.2.0
 
 ### 9.4 回滚操作
 
-**场景**：SIT 环境发现 tenant-b 配置有问题，需要回滚到上一个版本。
+**场景**：SIT 环境发现 tenant-b 的 `project-x` 配置有问题，需要回滚到上一个版本。
 
 1. 进入 `tenant-b` 仓库 → **Actions** → 选择 `TapData Rollback`（如有）
-2. 或手动触发工作流，指定回滚目标 Tag（如 `tenant-b-v1.1.0`）
-3. 工作流会执行：停止任务 → 清理资源 → 从目标版本重新导入 → 重新激活
-4. 仅 tenant-b 的资源受影响，tenant-a 完全不受干扰
+2. 或手动触发工作流，输入：目标 Tag（如 `tenant-b-v1.1.0`）+ 项目名（`project-x`）
+3. 工作流会执行：扫描 export 收集 `project-x` 的任务/API 名 → 仅停止 `project-x` 的任务 → 仅下线 `project-x` 的 API → 仅清理 `project-x` 的资源 → 从目标 Tag 重新导入 → 重新激活
+4. 隔离边界：
+   - tenant-a 仓库的资源完全不受影响
+   - 同租户但不同项目（如 `tenant-b/project-y`）的资源也完全不受影响
+   - 同租户同项目但不同环境（如 dev/aat）的资源完全不受影响
 
 ### 9.5 新增租户
 
