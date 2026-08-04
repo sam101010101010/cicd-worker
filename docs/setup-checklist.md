@@ -127,6 +127,8 @@ Configure at `{team_org}` > **Settings** > **Secrets and variables** > **Actions
 
 - [ ] `SIT_TAPDATA_URL` (e.g. `http://10.0.0.1:3030`)
 - [ ] `LPT_TAPDATA_URL`
+- [ ] `VAULT_TRANSPORT` — *(optional)* how vault.json is passed between Jobs. `auto` (default, unset): try `upload-artifact@v4`, and if it is unavailable fall back to a local file; `local`: skip artifacts entirely (no error log noise) — **use this on a single self-hosted runner where artifacts are not supported**; `artifact`: force native `upload-artifact@v4` and **never** use the local file — fails if v4 is unavailable. Local-file mode requires all Jobs to run on the **same** runner.
+  > **GHES / older servers that only support artifact v3:** the live `.github/workflows/tapdata-deploy.yml` uses artifact **v4** and has no inline v3 fallback. Promote the **`.github/deploy/tapdata-deploy-matrix-artifact-v3.yml`** variant (artifact pinned to v3) into `.github/workflows/tapdata-deploy.yml` instead — see `docs/cicd-delivery-guide.md` §2.1.1.
 
 ### 2.3 Per-Tenant Repository Configuration
 
@@ -198,9 +200,18 @@ Configure at tenant repo > **Settings** > **Secrets and variables** > **Actions*
 - [ ] `sit` environment database credentials configured
 - [ ] `lpt` environment database credentials configured
 
+**Optional repository variable (only when project name differs from repo name):**
+
+- [ ] `PROJECT_NAME` — set on the tenant repo if the TapData project name and `{project}_tapdata_export/` directory prefix should differ from the repo name. Leave unset to default to the repo name.
+
+> **Project name resolution priority** (highest first):
+> 1. `workflow_dispatch` manual input `project` (per-run override)
+> 2. Repository variable `vars.PROJECT_NAME`
+> 3. Repository name (`github.event.repository.name`)
+
 **TapData platform:**
 
-- [ ] Create a project on TapData platform with the name matching the tenant repository name (e.g. repository `your-tenant-repo` → project name `your-tenant-repo`)
+- [ ] Create a project on TapData platform whose name matches the resolved project name. By default this is the tenant repository name (e.g. repo `your-tenant-repo` → project `your-tenant-repo`). If `PROJECT_NAME` is set, the project name on TapData must match that variable's value instead.
 
 ---
 
