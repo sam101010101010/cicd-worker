@@ -133,11 +133,51 @@ UPDATE_LIST=$(echo "${BODY}" | jq -r '.data.update // []')
 DELETE_LIST=$(echo "${BODY}" | jq -r '.data.delete // []')
 COMMAND_LIST=$(echo "${BODY}" | jq -c '.data.commands // []' 2>/dev/null || echo "[]")
 
+# TAP-12057: orphan indexes -- in the target collection, declared by no API. Flattened across
+# targets so the section reads as one list. TM has already dropped `_id_` from this bucket
+# (every collection has it; it is not an orphan) while still counting it toward the 64 limit.
+ORPHAN_LIST=$(echo "${BODY}" | jq -c '[.data.report.targets[]? | . as $t | (.extra // [])[] | {
+  connection: ($t.connectionName // "-"),
+  table: ($t.tableName // "-"),
+  name: (.name // "-"),
+  keys: ((.fields // []) | map(.field + ":" + (if .asc == false then "-1" else "1" end)) | join(",")),
+  unique: (.unique // false)
+}]' 2>/dev/null || echo "[]")
+ORPHAN_COUNT=$(echo "${ORPHAN_LIST}" | jq 'length' 2>/dev/null || echo 0)
+
 ADD_COUNT=$(echo "${ADD_LIST}" | jq 'length')
 UPDATE_COUNT=$(echo "${UPDATE_LIST}" | jq 'length')
 DELETE_COUNT=$(echo "${DELETE_LIST}" | jq 'length')
 
 echo "Preview results - Add: ${ADD_COUNT}, Update: ${UPDATE_COUNT}, Delete: ${DELETE_COUNT}"
+
+# TAP-12057: how many of the changed APIs changed NOTHING but their serving-index declarations.
+#
+# A declaration lives inside the Module document -- that is exactly what makes it travel through
+# CICD for free -- so ticking an index checkbox is a real change to the API document, and the APIs
+# leg must still import it or the declaration never reaches the target environment. The rollup,
+# though, said only "APIs -- Will deploy", which an approver reads as "the API itself changed":
+# different contract, different fields, worth scrutiny. TM already sends the field-level diff
+# (`servingIndexes[6].collected: true -> false`); this lifts that fact up into the rollup.
+#
+# The all/partial split is load-bearing: annotating whenever ANY change is a serving-index change
+# would let "declarations only" paper over a real API change riding along in the same run --
+# strictly worse than no annotation. An update with an empty `changes` list is never counted
+# either: we do not know what changed, and guessing would downplay it.
+INDEX_ONLY_COUNT=$(echo "${UPDATE_LIST}" | jq '[.[]
+  | select(type == "object")
+  | (.changes // []) as $c
+  | select(($c | length) > 0 and all($c[]; (.field // "") | startswith("servingIndexes")))
+] | length' 2>/dev/null || echo 0)
+
+INDEX_ONLY_NOTE=""
+if [[ "${INDEX_ONLY_COUNT}" -gt 0 ]]; then
+  if [[ "${ADD_COUNT}" -eq 0 && "${DELETE_COUNT}" -eq 0 && "${INDEX_ONLY_COUNT}" -eq "${UPDATE_COUNT}" ]]; then
+    INDEX_ONLY_NOTE="(serving-index declarations only)"
+  else
+    INDEX_ONLY_NOTE="(${INDEX_ONLY_COUNT} of ${UPDATE_COUNT} are serving-index declarations only)"
+  fi
+fi
 
 # 输出 has_changes 标志给 GitHub Actions
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
@@ -146,6 +186,7 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   else
     echo "has_changes=true" >> "${GITHUB_OUTPUT}"
   fi
+  echo "index_only_note=${INDEX_ONLY_NOTE}" >> "${GITHUB_OUTPUT}"
 fi
 
 # Build markdown content
@@ -315,6 +356,25 @@ MARKDOWN_TMPFILE=$(mktemp)
       echo '```'
       echo ""
     fi
+  fi
+
+  # TAP-12057: orphan indexes. These can never appear in the plan table -- they are not a change,
+  # so add/update/delete stay 0, the leg is skipped, and the summary otherwise says
+  # "No changes detected". But they are real cost: write amplification on every write, one slot
+  # out of MongoDB's 64-per-collection budget, and no one left who knows if dropping them is safe.
+  # Every rollback manufactures them (APIs revert, indexes are only-add and do not). The platform
+  # will not drop them -- that is ADR-0005/0008, not an oversight -- so the least it owes the
+  # operator is to say they are there. Direction is spelled out: an orphan LAST_CHANGE:-1 and a
+  # declared LAST_CHANGE:1 are different indexes.
+  if [[ "${ORPHAN_COUNT}" -gt 0 ]]; then
+    echo "### 🗂️ Orphan indexes (${ORPHAN_COUNT})"
+    echo ""
+    echo "> In the target collection, declared by no API. The platform never drops them — review and clean up by hand."
+    echo ""
+    echo "| connection | table | name | keys | unique |"
+    echo "| --- | --- | --- | --- | --- |"
+    echo "${ORPHAN_LIST}" | jq -r '.[] | "| `\(.connection)` | `\(.table)` | `\(.name)` | `\(.keys)` | `\(.unique)` |"'
+    echo ""
   fi
 } > "${MARKDOWN_TMPFILE}"
 
